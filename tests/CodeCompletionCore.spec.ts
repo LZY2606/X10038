@@ -10,11 +10,16 @@
 import * as fs from "fs";
 
 import {
-    BaseErrorListener, CharStream, CommonTokenStream, ParserRuleContext, RecognitionException,
+    BaseErrorListener, CharStream, CommonToken, CommonTokenStream, ListTokenSource, ParserRuleContext,
+    RecognitionException,
     Recognizer, Token, ATNSimulator,
 } from "antlr4ng";
 import { describe, expect, it } from "vitest";
 
+import { WumpusLexer } from "./generated/WumpusLexer";
+import { WumpusParser } from "./generated/WumpusParser";
+import { LongTokenLexer } from "./generated/LongTokenLexer";
+import { LongTokenParser } from "./generated/LongTokenParser";
 import { CPP14Parser } from "./generated/CPP14Parser";
 import { CPP14Lexer } from "./generated/CPP14Lexer";
 import { WhiteboxParser } from "./generated/WhiteboxParser";
@@ -726,6 +731,276 @@ describe("Code Completion Tests", () => {
 
             // The start token of the variableRef rule begins at token 'a'.
             expect(candidates.rules.get(ExprParser.RULE_variableRef)?.startTokenIndex).toEqual(6);
+        });
+    });
+
+    describe("Follow-set cache isolation between parser classes:", () => {
+        // WhiteboxParser and WumpusParser both start with "W" but have different ATNs. The follow-set
+        // cache used to be keyed by parser.constructor.name[0], so the second parser in an interleaved
+        // sequence silently reused the first parser's follow sets.
+
+        /**
+         * Serialize candidates into an order-independent, comparable form.
+         *
+         * @param candidates The collected completion candidates.
+         *
+         * @returns A stable JSON string of the collected tokens and rules.
+         */
+        const snapshot = (candidates: ReturnType<CodeCompletionCore["collectCandidates"]>): string => {
+            return JSON.stringify({
+                tokens: [...candidates.tokens.entries()]
+                    .map(([token, following]) => {
+                        return [token, [...following]];
+                    })
+                    .sort((a, b) => {
+                        return a[0] - b[0];
+                    }),
+                rules: [...candidates.rules.entries()]
+                    .map(([rule, info]) => {
+                        return [rule, { startTokenIndex: info.startTokenIndex, ruleList: [...info.ruleList] }];
+                    })
+                    .sort((a, b) => {
+                        return a[0] - b[0];
+                    }),
+            });
+        };
+
+        /**
+         * Completion for the Wumpus grammar at the EOF position after "WUMPUS".
+         *
+         * @returns The serialized completion candidates.
+         */
+        const collectWumpus = (): string => {
+            const lexer = new WumpusLexer(CharStream.fromString("WUMPUS "));
+            const tokenStream = new CommonTokenStream(lexer);
+            const parser = new WumpusParser(tokenStream);
+            parser.removeErrorListeners();
+            const context = parser.wumpus();
+            const core = new CodeCompletionCore(parser);
+
+            return snapshot(core.collectCandidates(1, context));
+        };
+
+        /**
+         * Completion for the Whitebox grammar at the EOF position after "LOREM".
+         *
+         * @returns The serialized completion candidates.
+         */
+        const collectWhitebox = (): string => {
+            const lexer = new WhiteboxLexer(CharStream.fromString("LOREM "));
+            const tokenStream = new CommonTokenStream(lexer);
+            const parser = new WhiteboxParser(tokenStream);
+            parser.removeErrorListeners();
+            const context = parser.test1();
+            const core = new CodeCompletionCore(parser);
+
+            return snapshot(core.collectCandidates(1, context));
+        };
+
+        it("exposes follow-set cache entries per parser constructor", () => {
+            // The static cache is private, but the observable guarantee is order independence. Accessing the
+            // internal map here documents the keying contract: different parser classes get different entries.
+            const cache = (CodeCompletionCore as unknown as {
+                followSetsByATN: Map<new () => object, unknown>;
+            }).followSetsByATN;
+
+            collectWumpus();
+            collectWhitebox();
+
+            expect(cache.has(WumpusParser)).toBe(true);
+            expect(cache.has(WhiteboxParser)).toBe(true);
+        });
+
+        it("Wumpus candidates are identical regardless of interleaving order", () => {
+            // Order A: Wumpus runs while its cache slot is still untouched.
+            const wumpusFirst = collectWumpus();
+            collectWhitebox();
+
+            // Order B (symmetric entry): Wumpus runs after the same-named-initial parser populated the cache.
+            const wumpusAfterWhitebox = collectWumpus();
+
+            const expected = JSON.stringify({
+                tokens: [[WumpusLexer.QUX, []]],
+                rules: [],
+            });
+            expect(wumpusFirst).toEqual(expected);
+            expect(wumpusAfterWhitebox).toEqual(expected);
+        });
+
+        it("Whitebox candidates are identical regardless of interleaving order", () => {
+            // Mirror of the previous test, starting from the other parser.
+            collectWumpus();
+            const whiteboxAfterWumpus = collectWhitebox();
+            const whiteboxFirst = collectWhitebox();
+
+            const expected = JSON.stringify({
+                tokens: [
+                    [WhiteboxLexer.IPSUM, []],
+                    [WhiteboxLexer.DOLOR, []],
+                    [WhiteboxLexer.SIT, []],
+                    [WhiteboxLexer.AMET, []],
+                    [WhiteboxLexer.CONSECTETUR, []],
+                ],
+                rules: [],
+            });
+            expect(whiteboxFirst).toEqual(expected);
+            expect(whiteboxAfterWumpus).toEqual(expected);
+        });
+
+        it("keeps the parsers isolated even after error recovery on malformed input", () => {
+            // A parse error must not change follow-set isolation: each parser still uses its own ATN.
+            const broken = (): string => {
+                const lexer = new WumpusLexer(CharStream.fromString("WUMPUS QUX QUX"));
+                const tokenStream = new CommonTokenStream(lexer);
+                const parser = new WumpusParser(tokenStream);
+                parser.removeErrorListeners();
+                parser.wumpus(); // Consumes extra input; exercises recovery without throwing.
+                const core = new CodeCompletionCore(parser);
+
+                return snapshot(core.collectCandidates(1));
+            };
+
+            collectWhitebox();
+            expect(broken()).toEqual(collectWumpus());
+            expect(collectWhitebox()).not.toEqual(collectWumpus());
+        });
+    });
+
+    describe("Shortcut memoization on long token streams:", () => {
+        // The shortcut map used to store entries under (tokenListIndex & 0xffff) while looking them up with
+        // the full index. Beyond 65535 default channel tokens the keys alias, dropping memoization hits for
+        // recursive rules. These tests construct token streams directly so they stay fast and deterministic
+        // (no external files, no sleeps, no absolute paths).
+
+        interface ILongStreamResult {
+            tokens: number[];
+            shortcutHits: number;
+            statesProcessed: number;
+        }
+
+        /**
+         * Builds `cells` repetitions of HEAD TAIL as a synthetic, fully filled token stream.
+         * `piece` (the rule consuming HEAD) is therefore re-entered at every even position from all
+         * `cell` alternatives.
+         *
+         * @param cells The number of HEAD TAIL cells to generate.
+         *
+         * @returns The filled synthetic token stream.
+         */
+        const buildLongTokenStream = (cells: number): CommonTokenStream => {
+            const tokens: CommonToken[] = [];
+            let tokenIndex = 0;
+            for (let i = 0; i < cells; ++i) {
+                const head = CommonToken.fromType(LongTokenLexer.HEAD, "HEAD");
+                head.channel = Token.DEFAULT_CHANNEL;
+                head.tokenIndex = tokenIndex++;
+                tokens.push(head);
+
+                const tail = CommonToken.fromType(LongTokenLexer.TAIL, "TAIL");
+                tail.channel = Token.DEFAULT_CHANNEL;
+                tail.tokenIndex = tokenIndex++;
+                tokens.push(tail);
+            }
+
+            const eof = CommonToken.fromType(Token.EOF, "<EOF>");
+            eof.channel = Token.DEFAULT_CHANNEL;
+            eof.tokenIndex = tokenIndex;
+            tokens.push(eof);
+
+            const tokenStream = new CommonTokenStream(
+                new ListTokenSource(tokens, "synthetic-long-token-stream"),
+            );
+            // Fill eagerly; an unfilled stream indexes lazily and does not model a real long file.
+            tokenStream.fill();
+
+            return tokenStream;
+        };
+
+        /**
+         * Runs completion once and reports candidate tokens plus memoization diagnostics.
+         *
+         * @param cells The number of HEAD TAIL cells in the synthetic stream.
+         *
+         * @returns The candidate tokens and memoization counters.
+         */
+        const completeLongStream = (cells: number): ILongStreamResult => {
+            const parser = new LongTokenParser(buildLongTokenStream(cells));
+            parser.removeErrorListeners();
+            const core = new CodeCompletionCore(parser);
+
+            // Caret on the TAIL token of the last cell, a parsed (non-caret-rule) position.
+            const caretTokenIndex = cells * 2 - 1;
+            const candidates = core.collectCandidates(caretTokenIndex);
+
+            return {
+                tokens: [...candidates.tokens.keys()].sort((a, b) => {
+                    return a - b;
+                }),
+                shortcutHits: core.shortcutHits,
+                statesProcessed: (core as unknown as { statesProcessed: number }).statesProcessed,
+            };
+        };
+
+        it("keeps full memoization below the 16-bit boundary (boundary side: under)", () => {
+            // 32768 cells -> piece positions 0, 2, ..., 65534. Nothing is truncated.
+            const result = completeLongStream(32768);
+
+            expect(result.tokens).toEqual([LongTokenLexer.TAIL]);
+            expect(result.shortcutHits).toBeGreaterThan(0);
+        });
+
+        it("keeps full memoization once positions cross 65535 (boundary side: over)", () => {
+            // 32769 cells -> piece positions include 65536 == 0 (mod 65536), the first aliasing pair.
+            const under = completeLongStream(32768);
+            const over = completeLongStream(32769);
+
+            // Adding one cell must not reset the memo: the extra cell adds a constant, positive number of
+            // hits (7 for this grammar: one first visit + the remaining cell alternatives served from cache).
+            expect(over.tokens).toEqual([LongTokenLexer.TAIL]);
+            expect(over.shortcutHits).toBeGreaterThan(under.shortcutHits);
+            expect(over.shortcutHits - under.shortcutHits).toEqual(7);
+        });
+
+        it("returns identical results on the first and repeated completion of a long stream", () => {
+            const parser = new LongTokenParser(buildLongTokenStream(32769));
+            parser.removeErrorListeners();
+            const core = new CodeCompletionCore(parser);
+            const caretTokenIndex = 32769 * 2 - 1;
+
+            const first = core.collectCandidates(caretTokenIndex);
+            const firstHits = core.shortcutHits;
+            const firstStates = (core as unknown as { statesProcessed: number }).statesProcessed;
+
+            const repeated = core.collectCandidates(caretTokenIndex);
+            const repeatedHits = core.shortcutHits;
+            const repeatedStates = (core as unknown as { statesProcessed: number }).statesProcessed;
+
+            expect([...repeated.tokens.keys()]).toEqual([...first.tokens.keys()]);
+            expect(repeatedHits).toEqual(firstHits);
+            // The second invocation must not do more ATN work than the first one.
+            expect(repeatedStates).toBeLessThanOrEqual(firstStates);
+        });
+
+        it("preserves memoization and results after a syntax error in a long stream", () => {
+            // Failure recovery: replace one TAIL with HEAD so the input is malformed, then complete at the
+            // position right after it. Candidates must stay stable and memoization must still be active.
+            const cells = 32769;
+            const tokenStream = buildLongTokenStream(cells);
+            tokenStream.fill();
+            const malformedIndex = 65537; // TAIL of the cell whose HEAD is at 65536.
+            const malformed = tokenStream.get(malformedIndex);
+            expect(malformed).toBeTruthy();
+            (malformed as CommonToken).type = LongTokenLexer.HEAD;
+
+            const parser = new LongTokenParser(tokenStream);
+            parser.removeErrorListeners();
+            const core = new CodeCompletionCore(parser);
+
+            const candidates = core.collectCandidates(malformedIndex);
+            expect(core.shortcutHits).toBeGreaterThan(0);
+            // Repeated completion after recovery is deterministic.
+            const again = core.collectCandidates(malformedIndex);
+            expect([...again.tokens.keys()]).toEqual([...candidates.tokens.keys()]);
         });
     });
 });

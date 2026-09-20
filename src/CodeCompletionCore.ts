@@ -56,7 +56,10 @@ class FollowSetWithPath {
  * A list of follow sets (for a given state number) + all of them combined for quick hit tests + whether they are
  * exhaustive (false if subsequent yet-unprocessed rules could add further tokens to the follow set, true otherwise).
  * This data is static in nature (because the used ATN states are part of a static struct: the ATN).
- * Hence it can be shared between all C3 instances, however it depends on the actual parser class (type).
+ * Hence it can be shared between all C3 instances, however it depends on the concrete parser class (and thus its
+ * ATN). The parser constructor is used as the cache key, which is unique per parser class: using only part of a
+ * class name (such as its first character) can map two unrelated parser classes with different ATNs to the same
+ * entry and would let one parser reuse another parser's follow sets.
  */
 class FollowSetsHolder {
     public sets: FollowSetWithPath[];
@@ -65,6 +68,9 @@ class FollowSetsHolder {
 }
 
 type FollowSetsPerState = Map<number, FollowSetsHolder>;
+
+/** Constructor of a concrete Parser subclass, which uniquely identifies the parser class and its ATN. */
+type ParserConstructor = new (...args: unknown[]) => Parser;
 
 /** Token stream position info after a rule was processed. */
 type RuleEndStatus = Set<number>;
@@ -76,7 +82,12 @@ interface IPipelineEntry {
 
 /** The main class for doing the collection process. */
 export class CodeCompletionCore {
-    private static followSetsByATN = new Map<string, FollowSetsPerState>();
+    /**
+     * Follow sets keyed by the parser class they were generated from. A parser constructor uniquely identifies a
+     * parser type (and its ATN), so follow sets of two parser classes can never alias each other here, even if the
+     * classes have identical or similarly spelled names.
+     */
+    private static followSetsByATN = new Map<ParserConstructor, FollowSetsPerState>();
 
     private static atnStateTypeMap: string[] = [
         "invalid",
@@ -126,6 +137,13 @@ export class CodeCompletionCore {
      */
     public translateRulesTopDown = false;
 
+    /**
+     * Number of times a rule walk was skipped because its result was already memoized for the current rule and
+     * token stream position. This is a diagnostic value to observe how effective the shortcut memoization is
+     * (e.g. in recursive grammars or on long token streams). It is reset for every collectCandidates call.
+     */
+    public shortcutHits = 0;
+
     private parser: Parser;
     private atn: ATN;
     private vocabulary: Vocabulary;
@@ -170,6 +188,7 @@ export class CodeCompletionCore {
         this.candidates.rules.clear();
         this.candidates.tokens.clear();
         this.statesProcessed = 0;
+        this.shortcutHits = 0;
         this.precedenceStack = [];
 
         this.tokenStartIndex = context?.start ? context.start.tokenIndex : 0;
@@ -483,6 +502,7 @@ export class CodeCompletionCore {
             this.shortcutMap.set(startState.ruleIndex, positionMap);
         } else {
             if (positionMap.has(tokenListIndex)) {
+                ++this.shortcutHits;
                 if (this.showDebugOutput) {
                     console.log("=====> shortcut");
                 }
@@ -500,10 +520,12 @@ export class CodeCompletionCore {
         // 3) We get this lookup for free with any 2nd or further visit of the same rule, which often happens
         //    in non trivial grammars, especially with (recursive) expressions and of course when invoking code
         //    completion multiple times.
-        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.parser.constructor.name[0]);
+        // The parser constructor identifies the parser class and, with it, the ATN the cached follow sets belong to.
+        const parserType = this.parser.constructor as ParserConstructor;
+        let setsPerState = CodeCompletionCore.followSetsByATN.get(parserType);
         if (!setsPerState) {
             setsPerState = new Map();
-            CodeCompletionCore.followSetsByATN.set(this.parser.constructor.name[0], setsPerState);
+            CodeCompletionCore.followSetsByATN.set(parserType, setsPerState);
         }
 
         let followSets = setsPerState.get(startState.stateNumber);
@@ -738,8 +760,11 @@ export class CodeCompletionCore {
             this.precedenceStack.pop();
         }
 
-        // Cache the result, for later lookup to avoid duplicate walks.
-        positionMap.set(tokenListIndex & 0xffff, result);
+        // Cache the result, for later lookup to avoid duplicate walks. The key has to be the full token list
+        // index. Truncating it (e.g. to the lower 16 bits) aliases positions that are 65536 apart: on token
+        // streams with more than 65536 default channel tokens the lookup would then miss an existing entry (or
+        // even find the entry of a different position) and silently lose the recursive-rule memoization.
+        positionMap.set(tokenListIndex, result);
 
         return result;
     }
