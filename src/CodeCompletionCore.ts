@@ -76,7 +76,7 @@ interface IPipelineEntry {
 
 /** The main class for doing the collection process. */
 export class CodeCompletionCore {
-    private static followSetsByATN = new Map<string, FollowSetsPerState>();
+    private static followSetsByATN = new Map<ATN, FollowSetsPerState>();
 
     private static atnStateTypeMap: string[] = [
         "invalid",
@@ -500,10 +500,13 @@ export class CodeCompletionCore {
         // 3) We get this lookup for free with any 2nd or further visit of the same rule, which often happens
         //    in non trivial grammars, especially with (recursive) expressions and of course when invoking code
         //    completion multiple times.
-        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.parser.constructor.name[0]);
+        // The follow sets are static per ATN, so the ATN instance (not the parser class name) must be
+        // used as the cache key. Otherwise parsers with a similar class name but a different ATN would
+        // pollute each other's cache entries.
+        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.atn);
         if (!setsPerState) {
             setsPerState = new Map();
-            CodeCompletionCore.followSetsByATN.set(this.parser.constructor.name[0], setsPerState);
+            CodeCompletionCore.followSetsByATN.set(this.atn, setsPerState);
         }
 
         let followSets = setsPerState.get(startState.stateNumber);
@@ -738,8 +741,10 @@ export class CodeCompletionCore {
             this.precedenceStack.pop();
         }
 
-        // Cache the result, for later lookup to avoid duplicate walks.
-        positionMap.set(tokenListIndex & 0xffff, result);
+        // Cache the result, for later lookup to avoid duplicate walks. The full token list index is
+        // part of the key; truncating it would alias distant positions and break the memoization for
+        // long token streams.
+        positionMap.set(tokenListIndex, result);
 
         return result;
     }

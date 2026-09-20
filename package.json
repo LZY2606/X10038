@@ -24,7 +24,7 @@
         "prepublishOnly": "npm run build && npm run generate && npm run test",
         "test-coverage": "npm run test --coverage",
         "test": "vitest run --no-watch --no-coverage",
-        "generate": "antlr-ng -Dlanguage=TypeScript tests/CPP14.g4 tests/Expr.g4 tests/Whitebox.g4 -l false -o tests/generated --exact-output-dir",
+        "generate": "antlr-ng -Dlanguage=TypeScript tests/CPP14.g4 tests/Expr.g4 tests/ExprConflict.g4 tests/LongChain.g4 tests/Whitebox.g4 -l false -o tests/generated --exact-output-dir",
         "eslint": "eslint .",
         "build-mjs": "npm run build-bundle -- --outfile=lib/index.mjs --format=esm",
         "build-cjs": "npm run build-bundle -- --outfile=lib/index.cjs --format=cjs",

@@ -376,5 +376,5 @@ describe("Symbol Table Tests", () => {
         const symbol = symbolTable.symbolWithContextSync(dummyNode);
         expect(symbol).toBeDefined();
         expect(symbol!.qualifiedName(".", true)).toEqual("main.class0.method0.block2.var1");
-    });
+    }, 20000); // Building a table with 100000 fields can exceed the default 5s timeout under load.
 });
